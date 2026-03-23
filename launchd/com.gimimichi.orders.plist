@@ -7,26 +7,26 @@
   <string>com.gimimichi.orders</string>
   <key>ProgramArguments</key>
   <array>
-    <string>YOUR_PYTHON_PATH</string>
-    <string>YOUR_PROJECT_PATH/main.py</string>
+    <string>/Library/Frameworks/Python.framework/Versions/3.12/bin/python3</string>
+    <string>/Users/nishankgoyal/gimimichi-automation/main.py</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>YOUR_PROJECT_PATH</string>
+  <string>/Users/nishankgoyal/gimimichi-automation</string>
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key><integer>22</integer>
     <key>Minute</key><integer>0</integer>
   </dict>
   <key>StandardOutPath</key>
-  <string>YOUR_PROJECT_PATH/logs/launchd_stdout.log</string>
+  <string>/Users/nishankgoyal/gimimichi-automation/logs/launchd_stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>YOUR_PROJECT_PATH/logs/launchd_stderr.log</string>
+  <string>/Users/nishankgoyal/gimimichi-automation/logs/launchd_stderr.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/Library/Frameworks/Python.framework/Versions/3.12/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
-    <string>YOUR_HOME_PATH</string>
+    <string>/Users/nishankgoyal</string>
   </dict>
   <key>RunAtLoad</key><false/>
   <key>KeepAlive</key><false/>
