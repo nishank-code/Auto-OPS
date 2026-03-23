@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gimimichi.orders</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>YOUR_PYTHON_PATH</string>
+    <string>YOUR_PROJECT_PATH/main.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>YOUR_PROJECT_PATH</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>22</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>YOUR_PROJECT_PATH/logs/launchd_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>YOUR_PROJECT_PATH/logs/launchd_stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>YOUR_HOME_PATH</string>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+</dict>
+</plist>
