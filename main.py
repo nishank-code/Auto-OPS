@@ -455,12 +455,15 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
     # ── Step 4: Invoice + label — parallel with concurrency cap ───────────────
     log.info("Creating invoices + labels…")
     import base64
+    import time
 
-    INVOICE_CONCURRENCY = 15
+    INVOICE_CONCURRENCY = 3
     sem = asyncio.Semaphore(INVOICE_CONCURRENCY)
+    order_times: list[float] = []   # per-order elapsed seconds (for sequential estimate)
 
     async def _process_one(code):
         async with sem:
+            _t0 = time.monotonic()
             result    = await client.create_invoice_and_label(code)
             label_url = result.get("shippingLabelLink")
             label_b64 = result.get("label", "")
@@ -477,6 +480,8 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
                 client.get_invoice_pdf(code),
                 _get_label(),
             )
+
+            order_times.append(time.monotonic() - _t0)
 
             prov_code = result.get("shippingProviderCode", "")
             if not prov_code:
@@ -498,9 +503,18 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
                 "group":       group,
             }
 
+    _parallel_t0 = time.monotonic()
     raw_results = await asyncio.gather(
         *[_process_one(c) for c in codes],
         return_exceptions=True,
+    )
+    _parallel_elapsed = time.monotonic() - _parallel_t0
+    _sequential_estimate = sum(order_times)
+    _speedup = _sequential_estimate / _parallel_elapsed if _parallel_elapsed > 0 else 0
+    log.info(
+        f"  ⏱  Parallel wall-clock: {_parallel_elapsed:.1f}s | "
+        f"Sequential estimate: {_sequential_estimate:.1f}s | "
+        f"Speedup: {_speedup:.1f}×  (concurrency={INVOICE_CONCURRENCY})"
     )
 
     invoice_pdfs = []
