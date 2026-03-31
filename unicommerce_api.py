@@ -98,9 +98,12 @@ class UnicommerceClient:
         resp.raise_for_status()
         return resp.content
 
-    async def _post(self, path: str, body: dict) -> dict:
+    async def _post(self, path: str, body: dict, timeout: httpx.Timeout = None) -> dict:
         await self._ensure_token()
-        resp = await self._http.post(path, json=body, headers=self._headers())
+        kw = {"json": body, "headers": self._headers()}
+        if timeout is not None:
+            kw["timeout"] = timeout
+        resp = await self._http.post(path, **kw)
         if not resp.is_success:
             log.error(f"POST {path} → {resp.status_code}: {resp.text[:500]}")
         resp.raise_for_status()
@@ -176,22 +179,17 @@ class UnicommerceClient:
             "order_date":       order_details.get("displayOrderDateTime", ""),
         }
 
-    # ── 3. Get all codes for a specific channel ────────────────────────────────
-    async def get_all_codes_for_channel(
-        self,
-        status: str,
-        channel: str,
-        concurrency: int = 5,
-    ) -> tuple[list[str], dict]:
+    # ── 3a. Fetch ALL details in one pass (share across channels) ─────────────
+    async def get_all_details(self, status: str, concurrency: int = 15) -> dict:
         """
-        Fetches all shipment codes in `status`, then filters to `channel` by
-        calling getShippingPackageDetails for each (concurrently).
+        Fetch details for every shipment in `status` concurrently.
+        Returns {shipment_code: detail_dict}.
 
-        Returns (matching_codes, sku_map) where sku_map is
-        {shipment_code: {sku: qty}} for all matching shipments.
+        Call this once and pass the result to get_all_codes_for_channel() for
+        each channel — avoids re-fetching the same 400+ details per channel.
         """
         all_codes = await self.get_all_shipment_codes(status)
-        log.info(f"  {len(all_codes)} total {status} shipments — filtering by channel '{channel}'…")
+        log.info(f"  {len(all_codes)} total {status} shipments — fetching all details…")
 
         sem = asyncio.Semaphore(concurrency)
 
@@ -204,22 +202,37 @@ class UnicommerceClient:
                     return None
 
         results = await asyncio.gather(*[_fetch(c) for c in all_codes])
+        return {r["shipment_code"]: r for r in results if r}
+
+    # ── 3b. Filter pre-fetched details to a single channel ────────────────────
+    async def get_all_codes_for_channel(
+        self,
+        status: str,
+        channel: str,
+        concurrency: int = 15,
+        all_details: dict = None,
+    ) -> tuple[list[str], dict]:
+        """
+        Filter shipments in `status` to a single `channel`.
+        If `all_details` is provided (pre-fetched), no HTTP calls are made.
+
+        Returns (matching_codes, detail_map).
+        """
+        if all_details is None:
+            all_details = await self.get_all_details(status, concurrency)
 
         matching_codes = []
         sku_map = {}
-        for detail in results:
-            if not detail:
-                continue
+        for code, detail in all_details.items():
             if detail["channel"].lower() == channel.lower():
-                code = detail["shipment_code"]
                 matching_codes.append(code)
-                sku_map[code] = detail  # full detail dict, not just qty_map
+                sku_map[code] = detail
 
         log.info(f"  → {len(matching_codes)} shipments match channel '{channel}'")
         return matching_codes, sku_map
 
     # ── 4. Create invoice + shipping label (CREATED → READY_TO_SHIP) ──────────
-    async def create_invoice_and_label(self, shipment_code: str) -> dict:
+    async def create_invoice_and_label(self, shipment_code: str, timeout: float = 25.0) -> dict:
         """
         Single call that creates the invoice, generates the label, and moves
         the shipment from CREATED to READY_TO_SHIP.
@@ -231,6 +244,10 @@ class UnicommerceClient:
 
         PREREQUISITE: Shipping provider AWB generation must be set to
         'List' or 'API' in Unicommerce → Settings → Shipping Providers.
+
+        `timeout` defaults to 25 s (not the client-level 60 s) so that a hung
+        courier API (e.g. Proship down) fails fast instead of blocking for a
+        full minute per order.
         """
         data = await self._post(
             "/services/rest/v1/oms/shippingPackage/createInvoiceAndGenerateLabel",
@@ -238,6 +255,7 @@ class UnicommerceClient:
                 "shippingPackageCode":          shipment_code,
                 "generateUniwareShippingLabel": True,
             },
+            timeout=httpx.Timeout(timeout, connect=15.0),
         )
         log.debug(f"  Invoice+Label: {shipment_code} → {data.get('invoiceDisplayCode')}")
         return data

@@ -135,13 +135,13 @@ def filter_by_date(codes: list, details_map: dict, filter_date) -> list:
 #  - CRED_Invoices.pdf — all invoices merged
 #  - CRED_{Courier}_Labels.pdf — one file per courier assigned by CRED
 # ═══════════════════════════════════════════════════════════════════════════════
-async def run_cred_flow(client, dry_run: bool, limit: int = None, filter_date=None) -> list[str]:
+async def run_cred_flow(client, dry_run: bool, limit: int = None, filter_date=None, all_details: dict = None) -> list[str]:
     import base64
     from pdf_utils import merge_pdfs, save_pdf
     errors = []
 
     log.info("Fetching CRED CREATED shipments…")
-    codes, details_map = await client.get_all_codes_for_channel("CREATED", channel="CRED")
+    codes, details_map = await client.get_all_codes_for_channel("CREATED", channel="CRED", all_details=all_details)
     log.info(f"  Found {len(codes)} CRED shipments")
 
     if filter_date:
@@ -159,52 +159,76 @@ async def run_cred_flow(client, dry_run: bool, limit: int = None, filter_date=No
         log.info(f"  [DRY RUN] Would process: {codes}")
         return errors
 
-    invoice_pdfs                    = []
-    courier_labels: dict[str, list] = {}  # courier_name → [label_pdf_bytes]
-    manifest_codes                  = []
-    manifest_provider_code          = ""
-    manifest_method_code            = "STD"
+    # ── Process all codes concurrently ────────────────────────────────────────
+    CONCURRENCY = 15
+    sem = asyncio.Semaphore(CONCURRENCY)
 
-    for code in codes:
-        try:
+    async def _process_one_cred(code):
+        async with sem:
             result    = await client.create_invoice_and_label(code)
             label_url = result.get("shippingLabelLink")
             label_b64 = result.get("label", "")
 
-            # Invoice — always fetch separately (label field = shipping label, not invoice)
-            invoice_pdfs.append(await client.get_invoice_pdf(code))
-            log.info(f"  ✓ Invoice: {code} → {result.get('invoiceDisplayCode')}")
+            async def _get_label():
+                if label_b64:
+                    return base64.b64decode(label_b64), "response"
+                if label_url:
+                    return await client.get_label_pdf(label_url), "url"
+                return None, None
 
-            # Label — base64 from response, or URL fallback
-            label_pdf = None
-            if label_b64:
-                label_pdf = base64.b64decode(label_b64)
-                log.info(f"  ✓ Label:   {code} (from response)")
-            elif label_url:
-                label_pdf = await client.get_label_pdf(label_url)
-                log.info(f"  ✓ Label:   {code} (from URL)")
-            else:
-                log.warning(f"  ⚠ No label for {code}")
+            invoice_pdf, (label_pdf, label_src) = await asyncio.gather(
+                client.get_invoice_pdf(code),
+                _get_label(),
+            )
 
-            # Determine courier name for grouping labels by courier
             prov_code = result.get("shippingProviderCode", "")
             detail    = details_map.get(code, {})
             if not prov_code:
                 prov_code = detail.get("shipping_provider", "")
-            method = detail.get("shipping_method", "STD") or "STD"
-
+            method       = detail.get("shipping_method", "STD") or "STD"
             courier_name = _normalise_courier(prov_code) if prov_code else "Unknown"
-            if label_pdf:
-                courier_labels.setdefault(courier_name, []).append(label_pdf)
 
-            manifest_codes.append(code)
-            if not manifest_provider_code and prov_code:
-                manifest_provider_code = prov_code
-                manifest_method_code   = method
+            return {
+                "code":         code,
+                "invoice_num":  result.get("invoiceDisplayCode"),
+                "invoice_pdf":  invoice_pdf,
+                "label_pdf":    label_pdf,
+                "label_src":    label_src,
+                "courier_name": courier_name,
+                "prov_code":    prov_code,
+                "method":       method,
+            }
 
-        except Exception as e:
-            log.error(f"  ✗ {code}: {e}")
-            errors.append(f"CRED invoice+label {code}: {e}")
+    log.info(f"  Creating invoices + labels for {len(codes)} CRED orders…")
+    raw_results = await asyncio.gather(
+        *[_process_one_cred(c) for c in codes],
+        return_exceptions=True,
+    )
+
+    invoice_pdfs                    = []
+    courier_labels: dict[str, list] = {}
+    manifest_codes                  = []
+    manifest_provider_code          = ""
+    manifest_method_code            = "STD"
+
+    for code, r in zip(codes, raw_results):
+        if isinstance(r, Exception):
+            log.error(f"  ✗ {code}: {type(r).__name__}: {r}")
+            errors.append(f"CRED invoice+label {code}: {type(r).__name__}: {r}")
+        else:
+            log.info(f"  ✓ Invoice: {r['code']} → {r['invoice_num']}")
+            if r["label_pdf"]:
+                log.info(f"  ✓ Label:   {r['code']} (from {r['label_src']})")
+            else:
+                log.warning(f"  ⚠ No label for {r['code']}")
+            if r["invoice_pdf"]:
+                invoice_pdfs.append(r["invoice_pdf"])
+            if r["label_pdf"]:
+                courier_labels.setdefault(r["courier_name"], []).append(r["label_pdf"])
+            manifest_codes.append(r["code"])
+            if not manifest_provider_code and r["prov_code"]:
+                manifest_provider_code = r["prov_code"]
+                manifest_method_code   = r["method"]
 
     # ── Save PDFs ──────────────────────────────────────────────────────────────
     if invoice_pdfs:
@@ -252,13 +276,13 @@ def _normalise_courier(raw: str) -> str:
 #  - Flipkart_Invoices.pdf — all invoices merged
 #  - Flipkart_Labels.pdf — all labels in one file
 # ═══════════════════════════════════════════════════════════════════════════════
-async def run_flipkart_flow(client, dry_run: bool, limit: int = None, filter_date=None) -> list[str]:
+async def run_flipkart_flow(client, dry_run: bool, limit: int = None, filter_date=None, all_details: dict = None) -> list[str]:
     import base64
     from pdf_utils import merge_pdfs, save_pdf
     errors = []
 
     log.info("Fetching Flipkart CREATED shipments…")
-    codes, details_map = await client.get_all_codes_for_channel("CREATED", channel="FLIPKART")
+    codes, details_map = await client.get_all_codes_for_channel("CREATED", channel="FLIPKART", all_details=all_details)
     log.info(f"  Found {len(codes)} Flipkart shipments")
 
     if filter_date:
@@ -276,51 +300,74 @@ async def run_flipkart_flow(client, dry_run: bool, limit: int = None, filter_dat
         log.info(f"  [DRY RUN] Would process: {codes}")
         return errors
 
-    invoice_pdfs           = []
-    label_pdfs             = []
-    manifest_codes         = []
-    manifest_provider_code = ""
-    manifest_method_code   = "STD"
+    # ── Process all codes concurrently ────────────────────────────────────────
+    CONCURRENCY = 15
+    sem = asyncio.Semaphore(CONCURRENCY)
 
-    for code in codes:
-        try:
+    async def _process_one_flipkart(code):
+        async with sem:
             result    = await client.create_invoice_and_label(code)
             label_url = result.get("shippingLabelLink")
             label_b64 = result.get("label", "")
 
-            # Invoice — always fetch separately
-            invoice_pdfs.append(await client.get_invoice_pdf(code))
-            log.info(f"  ✓ Invoice: {code} → {result.get('invoiceDisplayCode')}")
+            async def _get_label():
+                if label_b64:
+                    return base64.b64decode(label_b64), "response"
+                if label_url:
+                    return await client.get_label_pdf(label_url), "url"
+                return None, None
 
-            # Label — base64 from response, or URL fallback
-            label_pdf = None
-            if label_b64:
-                label_pdf = base64.b64decode(label_b64)
-                log.info(f"  ✓ Label:   {code} (from response)")
-            elif label_url:
-                label_pdf = await client.get_label_pdf(label_url)
-                log.info(f"  ✓ Label:   {code} (from URL)")
-            else:
-                log.warning(f"  ⚠ No label for {code}")
+            invoice_pdf, (label_pdf, label_src) = await asyncio.gather(
+                client.get_invoice_pdf(code),
+                _get_label(),
+            )
 
-            if label_pdf:
-                label_pdfs.append(label_pdf)
-
-            # Provider from invoice response or details fallback
             prov_code = result.get("shippingProviderCode", "")
             detail    = details_map.get(code, {})
             if not prov_code:
                 prov_code = detail.get("shipping_provider", "")
             method = detail.get("shipping_method", "STD") or "STD"
 
-            manifest_codes.append(code)
-            if not manifest_provider_code and prov_code:
-                manifest_provider_code = prov_code
-                manifest_method_code   = method
+            return {
+                "code":        code,
+                "invoice_num": result.get("invoiceDisplayCode"),
+                "invoice_pdf": invoice_pdf,
+                "label_pdf":   label_pdf,
+                "label_src":   label_src,
+                "prov_code":   prov_code,
+                "method":      method,
+            }
 
-        except Exception as e:
-            log.error(f"  ✗ {code}: {e}")
-            errors.append(f"Flipkart invoice+label {code}: {e}")
+    log.info(f"  Creating invoices + labels for {len(codes)} Flipkart orders…")
+    raw_results = await asyncio.gather(
+        *[_process_one_flipkart(c) for c in codes],
+        return_exceptions=True,
+    )
+
+    invoice_pdfs           = []
+    label_pdfs             = []
+    manifest_codes         = []
+    manifest_provider_code = ""
+    manifest_method_code   = "STD"
+
+    for code, r in zip(codes, raw_results):
+        if isinstance(r, Exception):
+            log.error(f"  ✗ {code}: {type(r).__name__}: {r}")
+            errors.append(f"Flipkart invoice+label {code}: {type(r).__name__}: {r}")
+        else:
+            log.info(f"  ✓ Invoice: {r['code']} → {r['invoice_num']}")
+            if r["label_pdf"]:
+                log.info(f"  ✓ Label:   {r['code']} (from {r['label_src']})")
+            else:
+                log.warning(f"  ⚠ No label for {r['code']}")
+            if r["invoice_pdf"]:
+                invoice_pdfs.append(r["invoice_pdf"])
+            if r["label_pdf"]:
+                label_pdfs.append(r["label_pdf"])
+            manifest_codes.append(r["code"])
+            if not manifest_provider_code and r["prov_code"]:
+                manifest_provider_code = r["prov_code"]
+                manifest_method_code   = r["method"]
 
     # ── Save PDFs ──────────────────────────────────────────────────────────────
     if invoice_pdfs:
@@ -353,12 +400,12 @@ async def run_flipkart_flow(client, dry_run: bool, limit: int = None, filter_dat
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SHOPIFY FLOW
 # ═══════════════════════════════════════════════════════════════════════════════
-async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date=None) -> list[str]:
+async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date=None, all_details: dict = None) -> list[str]:
     from pdf_utils import merge_pdfs, save_pdf
     errors = []
 
     log.info("Fetching Shopify CREATED shipments…")
-    codes, initial_sku_map = await client.get_all_codes_for_channel("CREATED", channel="Shopify")
+    codes, initial_sku_map = await client.get_all_codes_for_channel("CREATED", channel="Shopify", all_details=all_details)
     log.info(f"  Found {len(codes)} Shopify shipments")
 
     if filter_date:
@@ -409,21 +456,27 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
     log.info("Creating invoices + labels…")
     import base64
 
-    INVOICE_CONCURRENCY = 5
+    INVOICE_CONCURRENCY = 15
     sem = asyncio.Semaphore(INVOICE_CONCURRENCY)
 
     async def _process_one(code):
         async with sem:
-            result      = await client.create_invoice_and_label(code)
-            label_url   = result.get("shippingLabelLink")
-            label_b64   = result.get("label", "")
-            invoice_pdf = await client.get_invoice_pdf(code)
+            result    = await client.create_invoice_and_label(code)
+            label_url = result.get("shippingLabelLink")
+            label_b64 = result.get("label", "")
 
-            label_pdf = None
-            if label_url:
-                label_pdf = await client.get_label_pdf(label_url)
-            elif label_b64:
-                label_pdf = base64.b64decode(label_b64)
+            async def _get_label():
+                if label_url:
+                    return await client.get_label_pdf(label_url)
+                if label_b64:
+                    return base64.b64decode(label_b64)
+                return None
+
+            # Fetch invoice PDF and download label concurrently
+            invoice_pdf, label_pdf = await asyncio.gather(
+                client.get_invoice_pdf(code),
+                _get_label(),
+            )
 
             prov_code = result.get("shippingProviderCode", "")
             if not prov_code:
@@ -476,8 +529,8 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
                     log.error(f"  ✗ No Shopify order ID found for {code} — manual cancellation required")
                     errors.append(f"Shopify NOT_SERVICEABLE (no order ID) {code}")
             else:
-                log.error(f"  ✗ {code}: {r}")
-                errors.append(f"Shopify invoice+label {code}: {r}")
+                log.error(f"  ✗ {code}: {type(r).__name__}: {r}")
+                errors.append(f"Shopify invoice+label {code}: {type(r).__name__}: {r}")
         else:
             log.info(f"  ✓ Invoice: {r['code']} → {r['invoice_num']}")
             if r["label_pdf"]:
@@ -749,6 +802,16 @@ async def main():
         facility_code=os.environ["UNICOMMERCE_FACILITY"],
     ) as client:
 
+        # ── Fetch ALL shipment details once, shared across all channel flows ──
+        # This avoids re-fetching 400+ details per channel (would be 3× otherwise).
+        log.info("")
+        log.info("━━━━━━━━━━━━━━━━━━ FETCHING SHIPMENTS ━━━━━━━━━━━━━━")
+        try:
+            all_details = await client.get_all_details("CREATED")
+        except Exception as e:
+            log.exception(f"❌ Failed to fetch shipment details: {e}")
+            sys.exit(1)
+
         # ── CRED ──────────────────────────────────────────────────────────────
         log.info("")
         log.info("━━━━━━━━━━━━━━━━━━━━ CRED FLOW ━━━━━━━━━━━━━━━━━━━━")
@@ -756,7 +819,7 @@ async def main():
             log.info("  Skipped")
         else:
             try:
-                errs = await run_cred_flow(client, dry_run, limit=effective_cred_limit, filter_date=filter_date)
+                errs = await run_cred_flow(client, dry_run, limit=effective_cred_limit, filter_date=filter_date, all_details=all_details)
                 all_errors.extend(errs)
                 if not errs:
                     log.info("✅ CRED flow complete")
@@ -771,7 +834,7 @@ async def main():
             log.info("  Skipped")
         else:
             try:
-                errs = await run_shopify_flow(client, dry_run, limit=effective_shopify_limit, filter_date=filter_date)
+                errs = await run_shopify_flow(client, dry_run, limit=effective_shopify_limit, filter_date=filter_date, all_details=all_details)
                 all_errors.extend(errs)
                 if not errs:
                     log.info("✅ Shopify flow complete")
@@ -786,7 +849,7 @@ async def main():
             log.info("  Skipped")
         else:
             try:
-                errs = await run_flipkart_flow(client, dry_run, limit=effective_flipkart_limit, filter_date=filter_date)
+                errs = await run_flipkart_flow(client, dry_run, limit=effective_flipkart_limit, filter_date=filter_date, all_details=all_details)
                 all_errors.extend(errs)
                 if not errs:
                     log.info("✅ Flipkart flow complete")

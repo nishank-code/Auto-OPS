@@ -1,8 +1,16 @@
+# Secrets — never commit these
 .env
 token.json
 credentials.json
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# macOS
 .DS_Store
+
+# Generated output (PDFs, labels, logs)
 output/
 logs/
