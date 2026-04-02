@@ -93,14 +93,15 @@ def check_env():
 # they accompany an experience box and go into that box's file automatically.
 # A shipment is assigned to the FIRST group whose primary SKU appears in it.
 SHOPIFY_LABEL_GROUPS = [
-    ("5FlavourExpBox",      ["GMK06105"]),
-    ("3+3ChickenExpBox",    ["GMK04306"]),
+    ("5FlavourExpBox",      ["GMK06105", "Experience_Box_Normal"]),
+    ("3+3ChickenExpBox",    ["GMK04306", "Experience_Box_Curry_Chicken_Shopify"]),
     ("VeggieExpBox",        ["GMK05106"]),
+    ("CheeseExpBox",        ["Experience_Box_Cheesy_Shopify"]),
     ("4_Pack", [
         # GMK 4-pack and 8-pack codes (8-packs grouped here as "pack-only")
         "GMK00104", "GMK00204", "GMK00304", "GMK00404", "GMK00504",
         "GMK01104", "GMK01204", "GMK00108", "GMK00208", "GMS00301",
-        # Legacy Shopify pack SKUs
+        # Legacy Shopify / Flipkart pack SKUs
         "Hot_Kimchi-4", "Korean_Spicy-4", "Hot_Kimchi-2_and_Korean_Spicy-2",
         "Hot_Chicken-2_and_Curry_Chicken-2", "Hot_Chicken-4",
         "Crazy_Cheesy_4", "Curry_Chicken_4",
@@ -111,6 +112,8 @@ SHOPIFY_LABEL_GROUPS = [
         "GMK06205",    # 5 Flavour Pack
         "GMK01306",    # Hot Chicken 3 + Curry Chicken 3
         "Korean_Kimchi-2_Korean_Spicy-2_Crazy_Cheesy-2",
+        # Flipkart 6-pack and 12-pack SKUs
+        "Hot_Kimchi-6", "Hot_Kimchi-6_and_Korean_Spicy-6",
     ]),
 ]
 
@@ -384,7 +387,9 @@ async def run_flipkart_flow(
             detail    = details_map.get(code, {})
             if not prov_code:
                 prov_code = detail.get("shipping_provider", "")
-            method = detail.get("shipping_method", "STD") or "STD"
+            method  = detail.get("shipping_method", "STD") or "STD"
+            qty_map = detail.get("qty_map", {})
+            group   = classify_shipment(set(qty_map.keys())) if label_pdf else None
 
             return {
                 "code":        code,
@@ -394,6 +399,7 @@ async def run_flipkart_flow(
                 "label_src":   label_src,
                 "prov_code":   prov_code,
                 "method":      method,
+                "group":       group,
             }
 
     log.info(f"  Creating invoices + labels for {len(codes)} Flipkart orders…")
@@ -403,7 +409,7 @@ async def run_flipkart_flow(
     )
 
     invoice_pdfs           = []
-    label_pdfs             = []
+    group_pdfs             = {g: [] for g, _ in SHOPIFY_LABEL_GROUPS}
     manifest_codes         = []
     manifest_provider_code = ""
     manifest_method_code   = "STD"
@@ -415,13 +421,13 @@ async def run_flipkart_flow(
         else:
             log.info(f"  ✓ Invoice: {r['code']} → {r['invoice_num']}")
             if r["label_pdf"]:
-                log.info(f"  ✓ Label:   {r['code']} (from {r['label_src']})")
+                log.info(f"  ✓ Label+Group: {r['code']} → '{r['group']}' (from {r['label_src']})")
             else:
                 log.warning(f"  ⚠ No label for {r['code']}")
             if r["invoice_pdf"]:
                 invoice_pdfs.append(r["invoice_pdf"])
-            if r["label_pdf"]:
-                label_pdfs.append(r["label_pdf"])
+            if r["label_pdf"] and r["group"]:
+                group_pdfs.setdefault(r["group"], []).append(r["label_pdf"])
             manifest_codes.append(r["code"])
             if not manifest_provider_code and r["prov_code"]:
                 manifest_provider_code = r["prov_code"]
@@ -431,9 +437,10 @@ async def run_flipkart_flow(
     if invoice_pdfs:
         save_pdf(merge_pdfs(invoice_pdfs), OUTPUT_DIR / "Flipkart_Invoices.pdf")
 
-    if label_pdfs:
-        save_pdf(merge_pdfs(label_pdfs), OUTPUT_DIR / f"Flipkart_Labels_{len(label_pdfs)}.pdf")
-        log.info(f"  Saved: Flipkart_Labels_{len(label_pdfs)}.pdf ({len(label_pdfs)} labels)")
+    for group_name, pdfs in group_pdfs.items():
+        if pdfs:
+            save_pdf(merge_pdfs(pdfs), OUTPUT_DIR / f"Flipkart_Labels_{group_name}_{len(pdfs)}.pdf")
+            log.info(f"  Saved: Flipkart_Labels_{group_name}_{len(pdfs)}.pdf ({len(pdfs)} labels)")
 
     # ── Single manifest for all Flipkart shipments ─────────────────────────────
     if manifest_codes:
