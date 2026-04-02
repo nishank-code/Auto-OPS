@@ -306,7 +306,8 @@ def load_orders(csv_path):
         skus_raw      = cols[sku_idx].strip()
 
         if not shipment_code or not skus_raw: continue
-        if not shipment_code.startswith("GIMI"): continue
+        # Accept both old format (GIMI...) and new format (SP/HR/26-27/...)
+        if not (shipment_code.startswith("GIMI") or shipment_code.startswith("SP/")): continue
 
         skus = [s.strip() for s in skus_raw.split(",") if s.strip()]
         orders[shipment_code] = {
@@ -380,7 +381,7 @@ def split_shipment(token, shipment_code, shipments):
     if resp.status_code == 200 and data.get("successful"):
         new_codes = data.get("splitNumberToShippingPackageCode", {})
         print(f"  ✓ Split successful → {new_codes}")
-        return new_codes  # e.g. {"1": "GIMI2121100", "2": "GIMI2121101"}
+        return new_codes  # e.g. {"1": "GIMI2121100", "2": "GIMI2121101"} or {"1": "SP/HR/26-27/00123", "2": "SP/HR/26-27/00124"}
     else:
         errors = data.get("errors", [])
         msgs = [e.get("message", str(e)) for e in errors] if errors else [str(data)]

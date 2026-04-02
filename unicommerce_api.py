@@ -143,7 +143,7 @@ class UnicommerceClient:
         Returns channel, order ID, and SKU→qty map for one shipment.
 
         POST /services/rest/v1/oms/shippingPackage/getShippingPackageDetails
-        Body: { "shippingPackageCode": "GIMI123" }
+        Body: { "shippingPackageCode": "GIMI123" or "SP/HR/26-27/00123" }
 
         SKUs come from saleOrderItems[].itemSku — each entry is one unit,
         so we count occurrences to build the qty map.
