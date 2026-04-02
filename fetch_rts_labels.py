@@ -1,11 +1,36 @@
 """
-One-off: download labels for all READY_TO_SHIP shipments for a given channel,
-group by SKU type, merge PDFs, and upload to Google Drive.
+One-off tool: download labels for shipments in a given status/channel,
+split by SKU group, merge into separate PDFs, and upload to Google Drive.
+
+This is NOT part of the daily automation — run it manually whenever you need
+to (re-)generate split label PDFs, e.g. after the main script runs or to
+recover labels for orders already past READY_TO_SHIP.
 
 Usage:
-  python3 fetch_rts_labels.py                    # Shopify (default)
-  python3 fetch_rts_labels.py --channel=FLIPKART
-  python3 fetch_rts_labels.py --channel=Shopify
+  python3 fetch_rts_labels.py                                        # Shopify, READY_TO_SHIP
+  python3 fetch_rts_labels.py --channel=FLIPKART                     # Flipkart, READY_TO_SHIP
+  python3 fetch_rts_labels.py --channel=FLIPKART --status=MANIFESTED # Flipkart, MANIFESTED
+
+Arguments:
+  --channel=<name>    Channel to filter by. Options: Shopify, FLIPKART, CRED (default: Shopify)
+  --status=<code>     Unicommerce shipment status code (default: READY_TO_SHIP)
+                      Common values: READY_TO_SHIP, MANIFESTED
+
+Output files (saved to output/YYYY-MM-DD/ and uploaded to the same Drive folder):
+  <Channel>_Labels_OGExpBox_N.pdf
+  <Channel>_Labels_CurryChickenExpBox_N.pdf
+  <Channel>_Labels_CheesyExpBox_N.pdf
+  <Channel>_Labels_VeggieExpBox_N.pdf
+  <Channel>_Labels_4Packs_N.pdf
+  <Channel>_Labels_6Packs_N.pdf
+
+SKU groups (same classification used by the daily automation):
+  OGExpBox           — Experience_Box_Normal, GMK06105
+  CurryChickenExpBox — Experience_Box_Curry_Chicken_Shopify, GMK04306
+  CheesyExpBox       — Experience_Box_Cheesy_Shopify
+  VeggieExpBox       — GMK05106
+  4Packs             — All 4-pack and 8-pack SKUs
+  6Packs             — All 6-pack and 12-pack SKUs
 """
 import asyncio, sys, logging, base64, os
 from pathlib import Path
@@ -65,11 +90,14 @@ def classify_shipment(sku_set):
 
 async def main():
     channel = "Shopify"
+    status  = "READY_TO_SHIP"
     for arg in sys.argv[1:]:
         if arg.startswith("--channel="):
             channel = arg.split("=", 1)[1]
+        elif arg.startswith("--status="):
+            status = arg.split("=", 1)[1]
 
-    log.info(f"Channel: {channel}")
+    log.info(f"Channel: {channel}  |  Status: {status}")
 
     async with UnicommerceClient(
         username=os.environ["UNICOMMERCE_USERNAME"],
@@ -78,9 +106,9 @@ async def main():
     ) as client:
 
         # ── Step 1: All RTS codes for the channel ─────────────────────────────
-        log.info(f"Fetching READY_TO_SHIP {channel} shipments…")
+        log.info(f"Fetching {status} {channel} shipments…")
         rts_codes, details_map = await client.get_all_codes_for_channel(
-            "READY_TO_SHIP", channel=channel
+            status, channel=channel
         )
         log.info(f"  {len(rts_codes)} shipments")
 
@@ -146,7 +174,10 @@ async def main():
 
         # ── Step 6: Upload to Google Drive ─────────────────────────────────────
         log.info("Uploading to Google Drive…")
-        uploader = GDriveUploader()
+        uploader = GDriveUploader(
+            root_folder_id=os.environ["GDRIVE_ROOT_FOLDER_ID"],
+            token_file=str(Path(__file__).parent / "token.json"),
+        )
         folder_id = uploader.get_or_create_date_folder(DATE_STR)
         for fpath in saved_files:
             uploader.upload_file(fpath, folder_id)
