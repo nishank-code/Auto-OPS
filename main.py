@@ -123,6 +123,16 @@ def classify_shipment(sku_set: set) -> str:
             return group_name
     return "OGExpBox"  # fallback for unknown experience box types
 
+# Shopify PDF filenames use the original group names (pre-Flipkart rename)
+SHOPIFY_GROUP_DISPLAY = {
+    "OGExpBox":           "5FlavourExpBox",
+    "CurryChickenExpBox": "3+3ChickenExpBox",
+    "VeggieExpBox":       "VeggieExpBox",
+    "CheesyExpBox":       "CheeseExpBox",
+    "4Packs":             "4_Pack",
+    "6Packs":             "6_Pack",
+}
+
 
 def filter_by_date(codes: list, details_map: dict, filter_date) -> list:
     """Filter shipment codes to only those whose order was placed on filter_date."""
@@ -632,8 +642,9 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
 
     for group_name, pdfs in group_pdfs.items():
         if pdfs:
-            save_pdf(merge_pdfs(pdfs), OUTPUT_DIR / f"Shopify_Labels_{group_name}_{len(pdfs)}.pdf")
-            log.info(f"  Saved: Shopify_Labels_{group_name}_{len(pdfs)}.pdf ({len(pdfs)} labels)")
+            display = SHOPIFY_GROUP_DISPLAY.get(group_name, group_name)
+            save_pdf(merge_pdfs(pdfs), OUTPUT_DIR / f"Shopify_Labels_{display}_{len(pdfs)}.pdf")
+            log.info(f"  Saved: Shopify_Labels_{display}_{len(pdfs)}.pdf ({len(pdfs)} labels)")
 
     # ── Step 6: One manifest per provider group, retry excluded codes ────────────
     total_dispatching = sum(len(v) for v in dispatching.values())
