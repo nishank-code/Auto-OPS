@@ -92,22 +92,22 @@ def check_env():
 # Stickers (GMS20002) and totes (GMS20001) are not used for classification —
 # they accompany an experience box and go into that box's file automatically.
 # A shipment is assigned to the FIRST group whose primary SKU appears in it.
-SHOPIFY_LABEL_GROUPS = [
-    ("5FlavourExpBox",      ["GMK06105", "Experience_Box_Normal"]),
-    ("3+3ChickenExpBox",    ["GMK04306", "Experience_Box_Curry_Chicken_Shopify"]),
+LABEL_GROUPS = [
+    ("OGExpBox",            ["GMK06105", "Experience_Box_Normal"]),
+    ("CurryChickenExpBox",  ["GMK04306", "Experience_Box_Curry_Chicken_Shopify"]),
     ("VeggieExpBox",        ["GMK05106"]),
-    ("CheeseExpBox",        ["Experience_Box_Cheesy_Shopify"]),
-    ("4_Pack", [
-        # GMK 4-pack and 8-pack codes (8-packs grouped here as "pack-only")
+    ("CheesyExpBox",        ["Experience_Box_Cheesy_Shopify"]),
+    ("4Packs", [
+        # Shopify GMK 4-pack and 8-pack codes
         "GMK00104", "GMK00204", "GMK00304", "GMK00404", "GMK00504",
         "GMK01104", "GMK01204", "GMK00108", "GMK00208", "GMS00301",
-        # Legacy Shopify / Flipkart pack SKUs
+        # Shopify legacy pack SKUs
         "Hot_Kimchi-4", "Korean_Spicy-4", "Hot_Kimchi-2_and_Korean_Spicy-2",
         "Hot_Chicken-2_and_Curry_Chicken-2", "Hot_Chicken-4",
         "Crazy_Cheesy_4", "Curry_Chicken_4",
         "Hot_Kimchi-8", "Korean_Spicy-8",
     ]),
-    ("6_Pack", [
+    ("6Packs", [
         "GMK02106",
         "GMK06205",    # 5 Flavour Pack
         "GMK01306",    # Hot Chicken 3 + Curry Chicken 3
@@ -118,10 +118,10 @@ SHOPIFY_LABEL_GROUPS = [
 ]
 
 def classify_shipment(sku_set: set) -> str:
-    for group_name, keywords in SHOPIFY_LABEL_GROUPS:
+    for group_name, keywords in LABEL_GROUPS:
         if any(kw in sku_set for kw in keywords):
             return group_name
-    return "5FlavourExpBox"  # fallback for unknown experience box types
+    return "OGExpBox"  # fallback for unknown experience box types
 
 
 def filter_by_date(codes: list, details_map: dict, filter_date) -> list:
@@ -409,7 +409,7 @@ async def run_flipkart_flow(
     )
 
     invoice_pdfs           = []
-    group_pdfs             = {g: [] for g, _ in SHOPIFY_LABEL_GROUPS}
+    group_pdfs             = {g: [] for g, _ in LABEL_GROUPS}
     manifest_codes         = []
     manifest_provider_code = ""
     manifest_method_code   = "STD"
@@ -583,7 +583,7 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
     )
 
     invoice_pdfs = []
-    group_pdfs   = {g: [] for g, _ in SHOPIFY_LABEL_GROUPS}
+    group_pdfs   = {g: [] for g, _ in LABEL_GROUPS}
     dispatching: dict[str, list[str]] = {}
     auto_cancelled = []
 
