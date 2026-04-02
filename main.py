@@ -25,6 +25,19 @@ Limiters:
     python3 main.py --limit=5                  # 5 orders per channel
     python3 main.py --shopify-only --limit=10  # 10 Shopify orders only
     python3 main.py --cred-limit=3 --shopify-limit=10 --flipkart-limit=5
+
+Flipkart TAT (dispatch deadline) filter:
+  By default Flipkart processes only orders due tomorrow (fulfillmentTat = tomorrow).
+  If run between 12:00 AM–1:59 AM, "tomorrow" is treated as today (late-night run).
+  Override with explicit date range:
+  --flipkart-start-date=DATE   Start of fulfillmentTat range (inclusive)
+  --flipkart-end-date=DATE     End of fulfillmentTat range (inclusive); defaults to start date
+
+  DATE accepts: '3 April', '2026-04-03', '3rd April 2026', etc.
+  Examples:
+    python3 main.py --flipkart-only                                        # tomorrow's TAT (default)
+    python3 main.py --flipkart-only --flipkart-start-date="3 April"        # single day
+    python3 main.py --flipkart-only --flipkart-start-date="1 April" --flipkart-end-date="5 April"
 """
 
 import asyncio
@@ -32,7 +45,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -125,6 +138,39 @@ def filter_by_date(codes: list, details_map: dict, filter_date) -> list:
         except Exception:
             pass
     log.info(f"  Date filter ({filter_date.strftime('%d %b %Y')}): {len(matched)}/{len(codes)} orders match")
+    return matched
+
+
+def get_flipkart_default_tat_date() -> date:
+    """
+    Returns the default dispatch-deadline date to target for Flipkart.
+    Normally this is tomorrow, but if the script is running between
+    12:00 AM and 1:59 AM we treat today as the target (late-night run
+    that belongs to the previous working session).
+    """
+    now = datetime.now()
+    if now.hour < 2:
+        return now.date()
+    return now.date() + timedelta(days=1)
+
+
+def filter_by_fulfillment_tat(
+    codes: list,
+    details_map: dict,
+    start_date: date,
+    end_date: date,
+) -> list:
+    """Filter Flipkart shipment codes to those whose fulfillmentTat falls within [start_date, end_date]."""
+    matched = []
+    for code in codes:
+        tat_ms = details_map.get(code, {}).get("fulfillment_tat")
+        if not tat_ms:
+            continue
+        tat_date = datetime.fromtimestamp(tat_ms / 1000).date()
+        if start_date <= tat_date <= end_date:
+            matched.append(code)
+    label = start_date.strftime("%d %b %Y") if start_date == end_date else f"{start_date.strftime('%d %b %Y')} – {end_date.strftime('%d %b %Y')}"
+    log.info(f"  TAT filter ({label}): {len(matched)}/{len(codes)} Flipkart orders match")
     return matched
 
 
@@ -276,7 +322,15 @@ def _normalise_courier(raw: str) -> str:
 #  - Flipkart_Invoices.pdf — all invoices merged
 #  - Flipkart_Labels.pdf — all labels in one file
 # ═══════════════════════════════════════════════════════════════════════════════
-async def run_flipkart_flow(client, dry_run: bool, limit: int = None, filter_date=None, all_details: dict = None) -> list[str]:
+async def run_flipkart_flow(
+    client,
+    dry_run: bool,
+    limit: int = None,
+    filter_date=None,
+    all_details: dict = None,
+    tat_start: date = None,
+    tat_end: date = None,
+) -> list[str]:
     import base64
     from pdf_utils import merge_pdfs, save_pdf
     errors = []
@@ -287,6 +341,10 @@ async def run_flipkart_flow(client, dry_run: bool, limit: int = None, filter_dat
 
     if filter_date:
         codes = filter_by_date(codes, details_map, filter_date)
+
+    # TAT (fulfillment deadline) filter — always applied for Flipkart;
+    # tat_start/tat_end are pre-computed by main() with the right defaults.
+    codes = filter_by_fulfillment_tat(codes, details_map, tat_start, tat_end)
 
     if not codes:
         log.info("  No Flipkart orders matched — skipping")
@@ -725,11 +783,13 @@ async def main():
     skip_cred     = "--skip-cred"     in sys.argv
     skip_shopify  = "--skip-shopify"  in sys.argv
     skip_flipkart = "--skip-flipkart" in sys.argv
-    global_limit   = None
-    cred_limit     = None
-    shopify_limit  = None
-    flipkart_limit = None
-    filter_date    = None   # datetime.date object if --date is set
+    global_limit        = None
+    cred_limit          = None
+    shopify_limit       = None
+    flipkart_limit      = None
+    filter_date         = None   # datetime.date object if --date is set
+    flipkart_tat_start  = None   # explicit TAT start date for Flipkart
+    flipkart_tat_end    = None   # explicit TAT end date for Flipkart
 
     for arg in sys.argv:
         if arg.startswith("--limit="):
@@ -765,11 +825,33 @@ async def main():
             except Exception:
                 log.error(f"Could not parse date: '{raw_date}'. Try formats like '22 March', '22nd March 2026', '2026-03-22'")
                 sys.exit(1)
+        elif arg.startswith("--flipkart-start-date="):
+            raw_date = arg.split("=", 1)[1]
+            try:
+                from dateutil import parser as dateparser
+                flipkart_tat_start = dateparser.parse(raw_date, dayfirst=True).date()
+            except Exception:
+                log.error(f"Could not parse --flipkart-start-date: '{raw_date}'. Try formats like '3 April', '2026-04-03'")
+                sys.exit(1)
+        elif arg.startswith("--flipkart-end-date="):
+            raw_date = arg.split("=", 1)[1]
+            try:
+                from dateutil import parser as dateparser
+                flipkart_tat_end = dateparser.parse(raw_date, dayfirst=True).date()
+            except Exception:
+                log.error(f"Could not parse --flipkart-end-date: '{raw_date}'. Try formats like '5 April', '2026-04-05'")
+                sys.exit(1)
 
     # Per-channel limits: channel-specific takes priority, global is fallback
     effective_cred_limit     = cred_limit     or global_limit
     effective_shopify_limit  = shopify_limit  or global_limit
     effective_flipkart_limit = flipkart_limit or global_limit
+
+    # Flipkart TAT date range — default to tomorrow (or today if running 12–2 AM)
+    if flipkart_tat_start is None:
+        flipkart_tat_start = get_flipkart_default_tat_date()
+    if flipkart_tat_end is None:
+        flipkart_tat_end = flipkart_tat_start
 
     # --only and --skip flags are mutually exclusive
     exclusives = sum([cred_only, shopify_only, flipkart_only])
@@ -798,6 +880,11 @@ async def main():
         mode += f" · limit({', '.join(limit_parts)})"
     if filter_date:
         mode += f" · date={filter_date.strftime('%d %b %Y')}"
+    if run_flipkart:
+        if flipkart_tat_start == flipkart_tat_end:
+            mode += f" · fk-tat={flipkart_tat_start.strftime('%d %b %Y')}"
+        else:
+            mode += f" · fk-tat={flipkart_tat_start.strftime('%d %b %Y')}–{flipkart_tat_end.strftime('%d %b %Y')}"
     if dry_run:
         mode += " · DRY RUN"
 
@@ -863,7 +950,7 @@ async def main():
             log.info("  Skipped")
         else:
             try:
-                errs = await run_flipkart_flow(client, dry_run, limit=effective_flipkart_limit, filter_date=filter_date, all_details=all_details)
+                errs = await run_flipkart_flow(client, dry_run, limit=effective_flipkart_limit, filter_date=filter_date, all_details=all_details, tat_start=flipkart_tat_start, tat_end=flipkart_tat_end)
                 all_errors.extend(errs)
                 if not errs:
                     log.info("✅ Flipkart flow complete")

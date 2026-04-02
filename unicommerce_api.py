@@ -177,6 +177,7 @@ class UnicommerceClient:
             "shipping_method":  shipping_method,
             "qty_map":          qty_map,
             "order_date":       order_details.get("displayOrderDateTime", ""),
+            "fulfillment_tat":  order_details.get("fulfillmentTat"),  # epoch ms; dispatch deadline
         }
 
     # ── 3a. Fetch ALL details in one pass (share across channels) ─────────────
