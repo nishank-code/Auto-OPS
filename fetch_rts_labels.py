@@ -1,20 +1,21 @@
 """
-One-off tool: download labels for shipments in a given status/channel,
+One-off tool: download shipping labels for shipments in a given status/channel,
 split by SKU group, merge into separate PDFs, and upload to Google Drive.
 
 This is NOT part of the daily automation — run it manually whenever you need
-to (re-)generate split label PDFs, e.g. after the main script runs or to
-recover labels for orders already past READY_TO_SHIP.
+split label PDFs, e.g. after the main script runs or to recover labels for
+orders already in MANIFESTED status.
 
 Usage:
-  python3 fetch_rts_labels.py                                        # Shopify, READY_TO_SHIP
-  python3 fetch_rts_labels.py --channel=FLIPKART                     # Flipkart, READY_TO_SHIP
-  python3 fetch_rts_labels.py --channel=FLIPKART --status=MANIFESTED # Flipkart, MANIFESTED
+  python3 fetch_rts_labels.py                                                    # Shopify, READY_TO_SHIP
+  python3 fetch_rts_labels.py --channel=FLIPKART                                 # Flipkart, READY_TO_SHIP
+  python3 fetch_rts_labels.py --channel=FLIPKART --status=MANIFESTED             # Flipkart, MANIFESTED only
+  python3 fetch_rts_labels.py --channel=FLIPKART --status=READY_TO_SHIP,MANIFESTED  # Both combined into one set of PDFs
 
 Arguments:
-  --channel=<name>    Channel to filter by. Options: Shopify, FLIPKART, CRED (default: Shopify)
-  --status=<code>     Unicommerce shipment status code (default: READY_TO_SHIP)
-                      Common values: READY_TO_SHIP, MANIFESTED
+  --channel=<name>      Channel to filter by. Options: Shopify, FLIPKART, CRED (default: Shopify)
+  --status=<code(s)>    Comma-separated Unicommerce status codes (default: READY_TO_SHIP)
+                        e.g. READY_TO_SHIP,MANIFESTED
 
 Output files (saved to output/YYYY-MM-DD/ and uploaded to the same Drive folder):
   <Channel>_Labels_OGExpBox_N.pdf
@@ -89,15 +90,15 @@ def classify_shipment(sku_set):
 
 
 async def main():
-    channel = "Shopify"
-    status  = "READY_TO_SHIP"
+    channel  = "Shopify"
+    statuses = ["READY_TO_SHIP"]
     for arg in sys.argv[1:]:
         if arg.startswith("--channel="):
             channel = arg.split("=", 1)[1]
         elif arg.startswith("--status="):
-            status = arg.split("=", 1)[1]
+            statuses = [s.strip() for s in arg.split("=", 1)[1].split(",")]
 
-    log.info(f"Channel: {channel}  |  Status: {status}")
+    log.info(f"Channel: {channel}  |  Statuses: {', '.join(statuses)}")
 
     async with UnicommerceClient(
         username=os.environ["UNICOMMERCE_USERNAME"],
@@ -105,46 +106,54 @@ async def main():
         facility_code=os.environ["UNICOMMERCE_FACILITY"],
     ) as client:
 
-        # ── Step 1: All RTS codes for the channel ─────────────────────────────
-        log.info(f"Fetching {status} {channel} shipments…")
-        rts_codes, details_map = await client.get_all_codes_for_channel(
-            status, channel=channel
-        )
-        log.info(f"  {len(rts_codes)} shipments")
+        # ── Step 1: Collect codes across all requested statuses ────────────────
+        all_codes   = []
+        sku_map     = {}
 
-        if not rts_codes:
+        for status in statuses:
+            log.info(f"Fetching {status} {channel} shipments…")
+            codes, details_map = await client.get_all_codes_for_channel(
+                status, channel=channel
+            )
+            log.info(f"  {len(codes)} shipments in {status}")
+            for code in codes:
+                if code not in sku_map:   # avoid duplicates if status overlap
+                    all_codes.append(code)
+                    qty_map = details_map.get(code, {}).get("qty_map", {})
+                    sku_map[code] = set(qty_map.keys()) if qty_map else set()
+
+        log.info(f"Total unique shipments: {len(all_codes)}")
+
+        if not all_codes:
             log.info("  Nothing to do.")
             return
 
-        # ── Step 2: Build SKU sets for classification ──────────────────────────
-        sku_map = {}
-        for code in rts_codes:
-            qty_map = details_map.get(code, {}).get("qty_map", {})
-            sku_map[code] = set(qty_map.keys()) if qty_map else set()
-
-        # ── Step 3: Download label PDFs (concurrency=5) ────────────────────────
-        log.info("Downloading label PDFs…")
+        # ── Step 2: Download shipping label PDFs (concurrency=5) ──────────────
+        log.info("Downloading shipping label PDFs…")
         sem = asyncio.Semaphore(5)
 
         async def get_label(code):
             async with sem:
-                data = await client._post(
-                    "/services/rest/v1/oms/shippingPackage/getInvoiceLabel",
-                    {"shippingPackageCode": code},
+                # createInvoiceAndGenerateLabel returns successful=False for already-processed
+                # orders but still populates shippingLabelLink with a fresh S3 URL.
+                # Bypass _post (which raises on successful=False) and read the raw response.
+                await client._ensure_token()
+                resp = await client._http.post(
+                    "/services/rest/v1/oms/shippingPackage/createInvoiceAndGenerateLabel",
+                    json={"shippingPackageCode": code, "generateUniwareShippingLabel": True},
+                    headers=client._headers(),
                 )
-                b64 = data.get("label") or data.get("invoiceLabel") or ""
-                if b64:
-                    return code, base64.b64decode(b64)
-                link = data.get("shippingLabelLink") or data.get("invoiceLabelLink", "")
+                data = resp.json()
+                link = data.get("shippingLabelLink", "")
                 if link:
                     return code, await client.get_label_pdf(link)
                 return code, None
 
         label_results = await asyncio.gather(
-            *[get_label(c) for c in rts_codes], return_exceptions=True
+            *[get_label(c) for c in all_codes], return_exceptions=True
         )
 
-        # ── Step 4: Classify and bucket ────────────────────────────────────────
+        # ── Step 3: Classify and bucket ────────────────────────────────────────
         group_pdfs = {g: [] for g, _ in LABEL_GROUPS}
         no_label   = []
 
@@ -161,7 +170,7 @@ async def main():
             group_pdfs[group].append(pdf)
             log.info(f"  ✓ {code} → {group}")
 
-        # ── Step 5: Save merged PDFs ───────────────────────────────────────────
+        # ── Step 4: Save merged PDFs ───────────────────────────────────────────
         log.info("Saving grouped PDFs…")
         prefix = channel.capitalize()
         saved_files = []
@@ -172,7 +181,7 @@ async def main():
                 log.info(f"  ✓ Saved: {fname} ({len(pdfs)} labels)")
                 saved_files.append(OUTPUT_DIR / fname)
 
-        # ── Step 6: Upload to Google Drive ─────────────────────────────────────
+        # ── Step 5: Upload to Google Drive ─────────────────────────────────────
         log.info("Uploading to Google Drive…")
         uploader = GDriveUploader(
             root_folder_id=os.environ["GDRIVE_ROOT_FOLDER_ID"],
@@ -186,8 +195,8 @@ async def main():
         # ── Summary ────────────────────────────────────────────────────────────
         total = sum(len(v) for v in group_pdfs.values())
         log.info(f"\n{'='*50}")
-        log.info(f"  Channel: {channel}")
-        log.info(f"  Total labels downloaded: {total} / {len(rts_codes)}")
+        log.info(f"  Channel: {channel}  |  Statuses: {', '.join(statuses)}")
+        log.info(f"  Total labels downloaded: {total} / {len(all_codes)}")
         log.info(f"  Missing labels: {len(no_label)}")
         log.info(f"  PDFs saved: {len(saved_files)}")
         for g, pdfs in group_pdfs.items():
