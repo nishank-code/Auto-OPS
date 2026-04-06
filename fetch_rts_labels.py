@@ -92,11 +92,17 @@ def classify_shipment(sku_set):
 async def main():
     channel  = "Shopify"
     statuses = ["READY_TO_SHIP"]
+    max_qty  = None
+    dispatch = False
     for arg in sys.argv[1:]:
         if arg.startswith("--channel="):
             channel = arg.split("=", 1)[1]
         elif arg.startswith("--status="):
             statuses = [s.strip() for s in arg.split("=", 1)[1].split(",")]
+        elif arg.startswith("--max-qty="):
+            max_qty = int(arg.split("=", 1)[1])
+        elif arg == "--dispatch":
+            dispatch = True
 
     log.info(f"Channel: {channel}  |  Statuses: {', '.join(statuses)}")
 
@@ -107,8 +113,9 @@ async def main():
     ) as client:
 
         # ── Step 1: Collect codes across all requested statuses ────────────────
-        all_codes   = []
-        sku_map     = {}
+        all_codes        = []
+        sku_map          = {}
+        details_map_full = {}   # accumulated across all statuses; needed for dispatch
 
         for status in statuses:
             log.info(f"Fetching {status} {channel} shipments…")
@@ -120,9 +127,15 @@ async def main():
                 if code not in sku_map:   # avoid duplicates if status overlap
                     all_codes.append(code)
                     qty_map = details_map.get(code, {}).get("qty_map", {})
-                    sku_map[code] = set(qty_map.keys()) if qty_map else set()
+                    sku_map[code] = qty_map if qty_map else {}
+                    details_map_full[code] = details_map.get(code, {})
 
         log.info(f"Total unique shipments: {len(all_codes)}")
+
+        if max_qty is not None:
+            filtered = [c for c in all_codes if sum(sku_map.get(c, {}).values()) <= max_qty]
+            log.info(f"Filtered to max-qty={max_qty}: {len(filtered)} / {len(all_codes)} shipments")
+            all_codes = filtered
 
         if not all_codes:
             log.info("  Nothing to do.")
@@ -205,6 +218,76 @@ async def main():
         if no_label:
             log.warning(f"  Missing: {no_label}")
         log.info(f"{'='*50}")
+
+        # ── Step 6 (optional): Quick Dispatch via manifest ─────────────────────
+        if not dispatch:
+            return
+
+        log.info("\nDispatching shipments via manifest…")
+
+        # Group by actual courier (falls back to shipping_provider / PROSHIP)
+        by_provider: dict[str, list[str]] = {}
+        for code in all_codes:
+            detail    = details_map_full.get(code, {})
+            courier   = detail.get("shipping_courier") or detail.get("shipping_provider") or "PROSHIP"
+            prov_code = courier.upper()
+            by_provider.setdefault(prov_code, []).append(code)
+
+        log.info(f"  {len(all_codes)} shipments across {len(by_provider)} provider(s): {list(by_provider)}")
+
+        MANIFEST_BATCH = 150
+        all_excluded = []
+        for prov_code, prov_codes in by_provider.items():
+            # Split into batches to respect the 200-package manifest limit
+            batches = [prov_codes[i:i + MANIFEST_BATCH] for i in range(0, len(prov_codes), MANIFEST_BATCH)]
+            for batch_num, batch in enumerate(batches, 1):
+                label = f"'{prov_code}' batch {batch_num}/{len(batches)}"
+                try:
+                    _, failed_codes = await client.create_and_complete_manifest(
+                        channel=channel.upper(),
+                        shipping_provider_code=prov_code,
+                        shipping_provider_name=prov_code,
+                        shipping_method_code="",
+                        shipment_codes=batch,
+                        third_party_shipping=False,
+                        is_aggregator=False,
+                    )
+                    log.info(f"  ✓ Manifest for {label}: {len(batch) - len(failed_codes)}/{len(batch)} dispatched")
+                    all_excluded.extend(failed_codes)
+                except Exception as e:
+                    log.error(f"  ✗ Manifest failed for {label}: {e}")
+
+        # Retry excluded codes with their actual assigned carrier
+        if all_excluded:
+            log.info(f"  Retrying {len(all_excluded)} excluded code(s) with actual carrier…")
+            retry_by_provider: dict[str, list[str]] = {}
+            for code in all_excluded:
+                try:
+                    detail      = await client.get_shipment_details(code)
+                    actual_prov = (detail.get("shipping_provider") or "PROSHIP").upper()
+                    retry_by_provider.setdefault(actual_prov, []).append(code)
+                    log.info(f"    {code} → actual carrier: {actual_prov}")
+                except Exception as e:
+                    log.error(f"    Could not fetch carrier for {code}: {e}")
+
+            for prov_code, retry_codes in retry_by_provider.items():
+                try:
+                    _, still_failed = await client.create_and_complete_manifest(
+                        channel=channel.upper(),
+                        shipping_provider_code=prov_code,
+                        shipping_provider_name=prov_code,
+                        shipping_method_code="",
+                        shipment_codes=retry_codes,
+                        third_party_shipping=False,
+                        is_aggregator=False,
+                    )
+                    log.info(f"  ✓ Retry manifest for '{prov_code}': {len(retry_codes) - len(still_failed)}/{len(retry_codes)} dispatched")
+                    for c in still_failed:
+                        log.error(f"  ✗ {c} still excluded — manual dispatch required")
+                except Exception as e:
+                    log.error(f"  Retry manifest failed for '{prov_code}': {e}")
+
+        log.info("Dispatch complete.")
 
 
 asyncio.run(main())
