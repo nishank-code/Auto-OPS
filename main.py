@@ -219,7 +219,7 @@ async def run_cred_flow(client, dry_run: bool, limit: int = None, filter_date=No
         return errors
 
     # ── Process all codes concurrently ────────────────────────────────────────
-    CONCURRENCY = 15
+    CONCURRENCY = 2
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async def _process_one_cred(code):
@@ -268,7 +268,7 @@ async def run_cred_flow(client, dry_run: bool, limit: int = None, filter_date=No
     courier_labels: dict[str, list] = {}
     manifest_codes                  = []
     manifest_provider_code          = ""
-    manifest_method_code            = "STD"
+    manifest_method_code            = ""
 
     for code, r in zip(codes, raw_results):
         if isinstance(r, Exception):
@@ -372,7 +372,7 @@ async def run_flipkart_flow(
         return errors
 
     # ── Process all codes concurrently ────────────────────────────────────────
-    CONCURRENCY = 15
+    CONCURRENCY = 2
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async def _process_one_flipkart(code):
@@ -532,13 +532,22 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
     import base64
     import time
 
-    INVOICE_CONCURRENCY = 3
+    INVOICE_CONCURRENCY = 2
     sem = asyncio.Semaphore(INVOICE_CONCURRENCY)
     order_times: list[float] = []   # per-order elapsed seconds (for sequential estimate)
 
     async def _process_one(code):
         async with sem:
             _t0 = time.monotonic()
+
+            # ── Serviceability pre-check ──────────────────────────────────────
+            # PROSHIP assigns AWBs without verifying sub-carrier pincode
+            # coverage, so create_invoice_and_label never raises NOT_SERVICEABLE.
+            # We must check proactively before invoicing.
+            serviceable = await client.is_serviceable(code)
+            if not serviceable:
+                raise UnicommerceAPIError(f"NOT_SERVICEABLE: pincode unserviceable for {code}")
+
             result    = await client.create_invoice_and_label(code)
             label_url = result.get("shippingLabelLink")
             label_b64 = result.get("label", "")
@@ -596,29 +605,42 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
     group_pdfs   = {g: [] for g, _ in LABEL_GROUPS}
     dispatching: dict[str, list[str]] = {}
     auto_cancelled = []
+    already_cancelled_shopify_ids: set[str] = set()  # prevent duplicate cancel calls for split siblings
+
+    from shopify_api import cancel_order
 
     for code, r in zip(codes, raw_results):
         if isinstance(r, Exception):
-            err_str = str(r)
-            if "NOT_SERVICEABLE" in err_str:
+            err_str = str(r).upper()
+            if (
+                "NOT_SERVICEABLE" in err_str
+                or "PINCODE_NOT_SERVICEABLE" in err_str
+                or "NO RECOMMENDED COURIER" in err_str
+                or "COURIER PARTNERS AVAILABLE" in err_str
+            ):
                 parent_code = child_to_parent.get(code, code)
                 detail      = initial_sku_map.get(parent_code, {})
                 shopify_oid = detail.get("shopify_order_id", "")
                 display_oid = detail.get("order_id", code)
-                log.warning(f"  ⚠ {code} (Order #{display_oid}): pincode unserviceable — auto-cancelling…")
-                if shopify_oid:
-                    from shopify_api import cancel_order
+                log.warning(f"  \u26a0 {code} (Order #{display_oid}): pincode unserviceable \u2014 auto-cancelling\u2026")
+                log.debug(f"    shopify_order_id={shopify_oid!r}  error={str(r)[:200]}")
+                if not shopify_oid:
+                    log.error(f"  \u2717 No Shopify order ID found for {code} \u2014 manual cancellation required")
+                    errors.append(f"Shopify NOT_SERVICEABLE (no order ID) {code}")
+                elif shopify_oid in already_cancelled_shopify_ids:
+                    # Another child of the same split parent was already cancelled
+                    log.info(f"  \u21a9 Order #{display_oid} already cancelled (sibling shipment) \u2014 skipping")
+                    auto_cancelled.append({"order_id": display_oid, "shipment_code": code})
+                else:
                     success = await cancel_order(shopify_oid, display_oid)
                     if success:
-                        log.info(f"  ✓ Order #{display_oid} cancelled on Shopify — customer will be auto-refunded")
+                        log.info(f"  \u2713 Order #{display_oid} cancelled on Shopify \u2014 customer will be auto-refunded")
+                        already_cancelled_shopify_ids.add(shopify_oid)
                         auto_cancelled.append({"order_id": display_oid, "shipment_code": code})
                     else:
                         errors.append(f"Shopify cancel/refund failed for order #{display_oid} ({code})")
-                else:
-                    log.error(f"  ✗ No Shopify order ID found for {code} — manual cancellation required")
-                    errors.append(f"Shopify NOT_SERVICEABLE (no order ID) {code}")
             else:
-                log.error(f"  ✗ {code}: {type(r).__name__}: {r}")
+                log.error(f"  \u2717 {code}: {type(r).__name__}: {r}")
                 errors.append(f"Shopify invoice+label {code}: {type(r).__name__}: {r}")
         else:
             log.info(f"  ✓ Invoice: {r['code']} → {r['invoice_num']}")
@@ -911,7 +933,7 @@ async def main():
     log.info(f"║    {DATE_STR}  [{mode}]")
     log.info("╚══════════════════════════════════════════════╝")
 
-    from unicommerce_api import UnicommerceClient
+    from unicommerce_api import UnicommerceClient, UnicommerceAPIError
 
     all_errors = []
 

@@ -68,6 +68,8 @@ EIGHT_PACK_SKUS = {
 SIX_PACK_SKUS   = {
     "Korean_Kimchi-2_Korean_Spicy-2_Crazy_Cheesy-2",  # Legacy
     "GMK02106",    # Veggie Trio Box: 2 Kimchi + 2 Spicy + 2 Cheesy (6-pack)
+    "GMK06205",    # 5 Flavour Pack (6-pack)
+    "GMK01306",    # Hot Chicken 3 + Curry Chicken 3 (6-pack)
 }
 STICKER_SKUS    = {"Stickers", "GMS20002"}   # GMS20002 = Sticker Set
 TOTE_SKUS       = {"Tote_Bag", "GMS20001"}   # GMS20001 = Daebak Tote Bag

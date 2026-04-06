@@ -233,7 +233,7 @@ class UnicommerceClient:
         return matching_codes, sku_map
 
     # ── 4. Create invoice + shipping label (CREATED → READY_TO_SHIP) ──────────
-    async def create_invoice_and_label(self, shipment_code: str, timeout: float = 25.0) -> dict:
+    async def create_invoice_and_label(self, shipment_code: str, timeout: float = 42.0) -> dict:
         """
         Single call that creates the invoice, generates the label, and moves
         the shipment from CREATED to READY_TO_SHIP.
@@ -246,7 +246,7 @@ class UnicommerceClient:
         PREREQUISITE: Shipping provider AWB generation must be set to
         'List' or 'API' in Unicommerce → Settings → Shipping Providers.
 
-        `timeout` defaults to 25 s (not the client-level 60 s) so that a hung
+        `timeout` defaults to 42 s (not the client-level 60 s) so that a hung
         courier API (e.g. Proship down) fails fast instead of blocking for a
         full minute per order.
         """
@@ -297,7 +297,41 @@ class UnicommerceClient:
             return resp.content
         return await self._download(label_url)
 
-    # ── 7. Dispatch ────────────────────────────────────────────────────────────
+    # ── 7. Check pincode serviceability ───────────────────────────────────────
+    async def is_serviceable(self, shipment_code: str) -> bool:
+        """
+        Check whether the pincode for a shipment is serviceable by its
+        assigned courier — BEFORE invoicing.
+
+        Uses the Unicommerce isServiceable endpoint so we don't rely on
+        create_invoice_and_label raising NOT_SERVICEABLE (which PROSHIP
+        never does — it assigns AWBs optimistically without checking sub-carrier
+        pincode coverage).
+
+        Returns True if serviceable, False if not.
+        Falls back to True on any unexpected error so as not to block processing.
+
+        POST /services/rest/v1/oms/shippingPackage/isServiceable
+        Body: { "shippingPackageCode": "..." }
+        """
+        try:
+            data = await self._post(
+                "/services/rest/v1/oms/shippingPackage/isServiceable",
+                {"shippingPackageCode": shipment_code},
+            )
+            return data.get("serviceable", True)
+        except UnicommerceAPIError as e:
+            err = str(e).upper()
+            if "NOT_SERVICEABLE" in err or "PINCODE" in err or "NO RECOMMENDED COURIER" in err or "COURIER PARTNERS AVAILABLE" in err:
+                return False
+            # Unknown API error — don't block the order, log and let it through
+            log.warning(f"  isServiceable check failed for {shipment_code}: {e} — assuming serviceable")
+            return True
+        except Exception as e:
+            log.warning(f"  isServiceable check failed for {shipment_code}: {e} — assuming serviceable")
+            return True
+
+    # ── 8. Dispatch ────────────────────────────────────────────────────────────
     async def dispatch(self, shipment_code: str) -> bool:
         """
         Mark a READY_TO_SHIP shipment as DISPATCHED.
