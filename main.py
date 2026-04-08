@@ -305,7 +305,7 @@ async def run_cred_flow(client, dry_run: bool, limit: int = None, filter_date=No
                 channel="CRED",
                 shipping_provider_code=manifest_provider_code or "UNKNOWN",
                 shipping_provider_name=manifest_provider_code or "UNKNOWN",
-                shipping_method_code=manifest_method_code,
+                shipping_method_code="",
                 shipment_codes=manifest_codes,
                 third_party_shipping=True,
                 is_aggregator=False,
@@ -539,15 +539,6 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
     async def _process_one(code):
         async with sem:
             _t0 = time.monotonic()
-
-            # ── Serviceability pre-check ──────────────────────────────────────
-            # PROSHIP assigns AWBs without verifying sub-carrier pincode
-            # coverage, so create_invoice_and_label never raises NOT_SERVICEABLE.
-            # We must check proactively before invoicing.
-            serviceable = await client.is_serviceable(code)
-            if not serviceable:
-                raise UnicommerceAPIError(f"NOT_SERVICEABLE: pincode unserviceable for {code}")
-
             result    = await client.create_invoice_and_label(code)
             label_url = result.get("shippingLabelLink")
             label_b64 = result.get("label", "")
@@ -603,7 +594,7 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
 
     invoice_pdfs = []
     group_pdfs   = {g: [] for g, _ in LABEL_GROUPS}
-    dispatching: dict[str, list[str]] = {}
+    dispatching: dict[str, dict[str, list[str]]] = {}  # category → prov_code → codes
     auto_cancelled = []
     already_cancelled_shopify_ids: set[str] = set()  # prevent duplicate cancel calls for split siblings
 
@@ -652,7 +643,8 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
                 invoice_pdfs.append(r["invoice_pdf"])
             if r["label_pdf"] and r["group"]:
                 group_pdfs.setdefault(r["group"], []).append(r["label_pdf"])
-            dispatching.setdefault(r["prov_code"], []).append(r["code"])
+            grp = r["group"] or "Unknown"
+            dispatching.setdefault(grp, {}).setdefault(r["prov_code"], []).append(r["code"])
 
     # ── Send WhatsApp notification for all cancellations ──────────────────────
     if auto_cancelled:
@@ -668,45 +660,52 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
             save_pdf(merge_pdfs(pdfs), OUTPUT_DIR / f"Shopify_Labels_{display}_{len(pdfs)}.pdf")
             log.info(f"  Saved: Shopify_Labels_{display}_{len(pdfs)}.pdf ({len(pdfs)} labels)")
 
-    # ── Step 6: One manifest per provider group, retry excluded codes ────────────
-    total_dispatching = sum(len(v) for v in dispatching.values())
+    # ── Step 6: One manifest per product category (split by provider within each) ─
+    total_dispatching = sum(len(codes) for by_prov in dispatching.values() for codes in by_prov.values())
     if dispatching:
-        log.info(f"Creating Shopify manifest(s) for {total_dispatching} shipments across {len(dispatching)} provider(s)…")
-        all_excluded = []
+        n_cats = len(dispatching)
+        log.info(f"Creating Shopify manifests for {total_dispatching} shipments across {n_cats} product categor{'y' if n_cats == 1 else 'ies'}…")
+        all_excluded_with_cat: list[tuple[str, str]] = []  # (code, category)
 
-        for prov_code, prov_codes in dispatching.items():
-            try:
-                _, failed_codes = await client.create_and_complete_manifest(
-                    channel="SHOPIFY",
-                    shipping_provider_code=prov_code,
-                    shipping_provider_name=prov_code,
-                    shipping_method_code="",
-                    shipment_codes=prov_codes,
-                    third_party_shipping=False,
-                    is_aggregator=True,
-                    shipping_courier=prov_code,
-                )
-                log.info(f"  ✓ Manifest created for '{prov_code}' ({len(prov_codes) - len(failed_codes)}/{len(prov_codes)} shipments)")
-                if failed_codes:
-                    all_excluded.extend(failed_codes)
-            except Exception as e:
-                log.error(f"  Shopify manifest failed for '{prov_code}': {e}")
-                errors.append(f"Shopify manifest {prov_code}: {e}")
+        for category, by_provider in dispatching.items():
+            display = SHOPIFY_GROUP_DISPLAY.get(category, category)
+            cat_total = sum(len(v) for v in by_provider.values())
+            log.info(f"  Category '{display}': {cat_total} shipment(s) across {len(by_provider)} provider(s)")
+
+            for prov_code, prov_codes in by_provider.items():
+                try:
+                    _, failed_codes = await client.create_and_complete_manifest(
+                        channel="SHOPIFY",
+                        shipping_provider_code=prov_code,
+                        shipping_provider_name=prov_code,
+                        shipping_method_code="",
+                        shipment_codes=prov_codes,
+                        third_party_shipping=False,
+                        is_aggregator=True,
+                        shipping_courier=prov_code,
+                    )
+                    log.info(f"  ✓ Manifest created: '{display}' [{prov_code}] ({len(prov_codes) - len(failed_codes)}/{len(prov_codes)} shipments)")
+                    if failed_codes:
+                        all_excluded_with_cat.extend((c, category) for c in failed_codes)
+                except Exception as e:
+                    log.error(f"  Shopify manifest failed for '{display}' [{prov_code}]: {e}")
+                    errors.append(f"Shopify manifest {display}/{prov_code}: {e}")
 
         # ── Retry excluded codes by fetching their actual assigned carrier ────
-        if all_excluded:
-            log.info(f"  Retrying {len(all_excluded)} excluded code(s) with their actual carrier…")
-            retry_by_provider: dict[str, list[str]] = {}
-            for code in all_excluded:
+        if all_excluded_with_cat:
+            log.info(f"  Retrying {len(all_excluded_with_cat)} excluded code(s) with their actual carrier…")
+            retry_by_cat_prov: dict[tuple[str, str], list[str]] = {}
+            for code, cat in all_excluded_with_cat:
                 try:
                     detail = await client.get_shipment_details(code)
                     actual_prov = (detail.get("shipping_provider") or "PROSHIP").upper()
-                    retry_by_provider.setdefault(actual_prov, []).append(code)
-                    log.info(f"    {code} → actual carrier: {actual_prov}")
+                    retry_by_cat_prov.setdefault((cat, actual_prov), []).append(code)
+                    log.info(f"    {code} ({SHOPIFY_GROUP_DISPLAY.get(cat, cat)}) → actual carrier: {actual_prov}")
                 except Exception as e:
                     log.error(f"    Could not fetch carrier for {code}: {e}")
 
-            for prov_code, retry_codes in retry_by_provider.items():
+            for (cat, prov_code), retry_codes in retry_by_cat_prov.items():
+                display = SHOPIFY_GROUP_DISPLAY.get(cat, cat)
                 try:
                     _, still_failed = await client.create_and_complete_manifest(
                         channel="SHOPIFY",
@@ -718,14 +717,14 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
                         is_aggregator=True,
                         shipping_courier=prov_code,
                     )
-                    log.info(f"  ✓ Retry manifest for '{prov_code}' ({len(retry_codes) - len(still_failed)}/{len(retry_codes)} added)")
+                    log.info(f"  ✓ Retry manifest: '{display}' [{prov_code}] ({len(retry_codes) - len(still_failed)}/{len(retry_codes)} added)")
                     if still_failed:
                         for c in still_failed:
                             log.error(f"  ✗ {c} still excluded — manual dispatch required")
                             errors.append(f"Shopify dispatch {c}: excluded from manifest after retry")
                 except Exception as e:
-                    log.error(f"  Retry manifest failed for '{prov_code}': {e}")
-                    errors.append(f"Shopify retry manifest {prov_code}: {e}")
+                    log.error(f"  Retry manifest failed for '{display}' [{prov_code}]: {e}")
+                    errors.append(f"Shopify retry manifest {display}/{prov_code}: {e}")
 
     return errors
 
