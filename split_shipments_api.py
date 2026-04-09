@@ -308,8 +308,8 @@ def load_orders(csv_path):
         skus_raw      = cols[sku_idx].strip()
 
         if not shipment_code or not skus_raw: continue
-        # Accept both old format (GIMI...) and new format (SP/HR/26-27/...)
-        if not (shipment_code.startswith("GIMI") or shipment_code.startswith("SP/")): continue
+        # Accept GIMI..., SP/HR/26-27/..., and new #2026NNNNNSHOP format
+        if not (shipment_code.startswith("GIMI") or shipment_code.startswith("SP/") or shipment_code.startswith("#2026")): continue
 
         skus = [s.strip() for s in skus_raw.split(",") if s.strip()]
         orders[shipment_code] = {
