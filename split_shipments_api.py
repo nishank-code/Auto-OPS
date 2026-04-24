@@ -42,8 +42,15 @@ EXPERIENCE_BOXES = {
     "Experience_Box_Curry_Chicken_Shopify",    # Curry Chicken Experience Box
     # GMK experience box codes
     "GMK06105",                                # 5 Flavour Experience Box
+    "GMK04104",                                # OG Experience Box
+    "GMK04204",                                # OG Experience Box + Stickers
     "GMK05106",                                # Kimchi 2 + Spicy 2 + Cheesy 2 Experience Box
     "GMK04306",                                # Hot Chicken 3 + Curry Chicken 3 Experience Box
+    "GMK03504",                                # 4 Cheesy Experience Box
+    "GMK03404",                                # 4 Curry Chicken Experience Box
+    "GMK03304",                                # 4 Hot Chicken Experience Box
+    "GMK06305",                                # 5 Flavour Bangtan Box
+    "GMK05206",                                # 2 Kimchi + 2 Spicy + 2 Cheesy Bangtan Box
 }
 FOUR_PACK_SKUS = {
     # Legacy Shopify SKUs
@@ -56,6 +63,7 @@ FOUR_PACK_SKUS = {
     "GMK00404",    # Curry Chicken 4 Pack
     "GMK00504",    # Cheesy 4 Pack
     "GMK01104",    # Kimchi 2 + Spicy 2 (4-pack)
+    "GMK01108",    # Kimchi 4 + Spicy 4 (2x 4-pack)
     "GMK01204",    # Curry Chicken 2 + Hot Chicken 2 (4-pack)
     "GMS00301",    # Hot Chicken Pack of 4 (legacy)
     # GMK 8-pack codes — treated as 4-packs (effectively 2x 4-pack)
@@ -68,6 +76,8 @@ EIGHT_PACK_SKUS = {
 SIX_PACK_SKUS   = {
     "Korean_Kimchi-2_Korean_Spicy-2_Crazy_Cheesy-2",  # Legacy
     "GMK02106",    # Veggie Trio Box: 2 Kimchi + 2 Spicy + 2 Cheesy (6-pack)
+    "GMK00106",    # 6 Kimchi (6-pack)
+    "GMK01112",    # 6 Kimchi + 6 Spicy (2x 6-pack)
     "GMK06205",    # 5 Flavour Pack (6-pack)
     "GMK01306",    # Hot Chicken 3 + Curry Chicken 3 (6-pack)
 }
@@ -83,8 +93,15 @@ STICKER_PRIORITY = [
     "Experience_Box_Curry_Chicken_Shopify",    # Curry Chicken
     "Experience_Box_Chicken_Shopify",          # Chicken
     "GMK06105",                                # 5 Flavour (1st among new)
+    "GMK04104",                                # OG Experience Box
+    "GMK04204",                                # OG Experience Box + Stickers
     "GMK05106",                                # Kimchi+Spicy+Cheesy (equal 2nd)
     "GMK04306",                                # Chicken+Curry Chicken (equal 2nd)
+    "GMK03504",                                # Cheesy Experience Box
+    "GMK03404",                                # Curry Chicken Experience Box
+    "GMK03304",                                # Hot Chicken Experience Box
+    "GMK06305",                                # 5 Flavour Bangtan Box
+    "GMK05206",                                # Veggie Bangtan Box
 ]
 TOTE_PRIORITY = [
     "Broke_Memers_Experience_Box_Shopify",     # Broke Memers
@@ -93,8 +110,15 @@ TOTE_PRIORITY = [
     "Experience_Box_Curry_Chicken_Shopify",    # Curry Chicken
     "Experience_Box_Chicken_Shopify",          # Chicken
     "GMK06105",                                # 5 Flavour (1st among new)
+    "GMK04104",                                # OG Experience Box
+    "GMK04204",                                # OG Experience Box + Stickers
     "GMK05106",                                # Kimchi+Spicy+Cheesy (equal 2nd)
     "GMK04306",                                # Chicken+Curry Chicken (equal 2nd)
+    "GMK03504",                                # Cheesy Experience Box
+    "GMK03404",                                # Curry Chicken Experience Box
+    "GMK03304",                                # Hot Chicken Experience Box
+    "GMK06305",                                # 5 Flavour Bangtan Box
+    "GMK05206",                                # Veggie Bangtan Box
 ]
 
 # ─── LABEL BATCH ORDER ─────────────────────────────────────────────────────
@@ -103,12 +127,13 @@ TOTE_PRIORITY = [
 LABEL_BATCHES = [
     ("Authentic Korean Experience Box",        {"Experience_Box_Normal_Shopify"}),
     ("Broke Memers Experience Box",            {"Broke_Memers_Experience_Box_Shopify"}),
-    ("Cheesy Experience Box",                  {"Experience_Box_Cheesy_Shopify"}),
-    ("Curry Chicken Experience Box",           {"Experience_Box_Curry_Chicken_Shopify"}),
-    ("Chicken Experience Box",                 {"Experience_Box_Chicken_Shopify"}),
-    ("5 Flavour Experience Box",               {"GMK06105"}),
+    ("Cheesy Experience Box",                  {"Experience_Box_Cheesy_Shopify", "GMK03504"}),
+    ("Curry Chicken Experience Box",           {"Experience_Box_Curry_Chicken_Shopify", "GMK03404"}),
+    ("Chicken Experience Box",                 {"Experience_Box_Chicken_Shopify", "GMK03304"}),
+    ("5 Flavour Experience Box",               {"GMK06105", "GMK04104", "GMK04204"}),
     ("Kimchi+Spicy+Cheesy Experience Box",     {"GMK05106"}),
     ("Chicken+Curry Chicken Experience Box",   {"GMK04306"}),
+    ("Bangtan Box",                            {"GMK06305", "GMK05206"}),
     ("Pack-only Shipments",                    FOUR_PACK_SKUS | EIGHT_PACK_SKUS | SIX_PACK_SKUS),
     ("Other / Mixed",                          set()),  # catch-all
 ]

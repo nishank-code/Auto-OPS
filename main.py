@@ -93,14 +93,16 @@ def check_env():
 # they accompany an experience box and go into that box's file automatically.
 # A shipment is assigned to the FIRST group whose primary SKU appears in it.
 LABEL_GROUPS = [
-    ("OGExpBox",            ["GMK06105", "Experience_Box_Normal"]),
-    ("CurryChickenExpBox",  ["GMK04306", "Experience_Box_Curry_Chicken_Shopify"]),
+    ("OGExpBox",            ["GMK06105", "GMK04104", "GMK04204", "Experience_Box_Normal"]),
+    ("CurryChickenExpBox",  ["GMK04306", "GMK03404", "Experience_Box_Curry_Chicken_Shopify"]),
     ("VeggieExpBox",        ["GMK05106"]),
-    ("CheesyExpBox",        ["Experience_Box_Cheesy_Shopify"]),
+    ("CheesyExpBox",        ["GMK03504", "Experience_Box_Cheesy_Shopify"]),
+    ("HotChickenExpBox",    ["GMK03304", "Experience_Box_Chicken_Shopify"]),
+    ("BangtanBox",          ["GMK06305", "GMK05206"]),
     ("4Packs", [
         # Shopify GMK 4-pack and 8-pack codes
         "GMK00104", "GMK00204", "GMK00304", "GMK00404", "GMK00504",
-        "GMK01104", "GMK01204", "GMK00108", "GMK00208", "GMS00301",
+        "GMK01104", "GMK01108", "GMK01204", "GMK00108", "GMK00208", "GMS00301",
         # Shopify legacy pack SKUs
         "Hot_Kimchi-4", "Korean_Spicy-4", "Hot_Kimchi-2_and_Korean_Spicy-2",
         "Hot_Chicken-2_and_Curry_Chicken-2", "Hot_Chicken-4",
@@ -109,6 +111,8 @@ LABEL_GROUPS = [
     ]),
     ("6Packs", [
         "GMK02106",
+        "GMK00106",    # 6 Kimchi
+        "GMK01112",    # 6 Kimchi + 6 Spicy
         "GMK06205",    # 5 Flavour Pack
         "GMK01306",    # Hot Chicken 3 + Curry Chicken 3
         "Korean_Kimchi-2_Korean_Spicy-2_Crazy_Cheesy-2",
@@ -129,6 +133,8 @@ SHOPIFY_GROUP_DISPLAY = {
     "CurryChickenExpBox": "3+3ChickenExpBox",
     "VeggieExpBox":       "VeggieExpBox",
     "CheesyExpBox":       "CheeseExpBox",
+    "HotChickenExpBox":   "HotChickenExpBox",
+    "BangtanBox":         "BangtanBox",
     "4Packs":             "4_Pack",
     "6Packs":             "6_Pack",
 }
@@ -305,7 +311,7 @@ async def run_cred_flow(client, dry_run: bool, limit: int = None, filter_date=No
                 channel="CRED",
                 shipping_provider_code=manifest_provider_code or "UNKNOWN",
                 shipping_provider_name=manifest_provider_code or "UNKNOWN",
-                shipping_method_code="",
+                shipping_method_code=manifest_method_code,
                 shipment_codes=manifest_codes,
                 third_party_shipping=True,
                 is_aggregator=False,
@@ -418,11 +424,9 @@ async def run_flipkart_flow(
         return_exceptions=True,
     )
 
-    invoice_pdfs           = []
-    group_pdfs             = {g: [] for g, _ in LABEL_GROUPS}
-    manifest_codes         = []
-    manifest_provider_code = ""
-    manifest_method_code   = "STD"
+    invoice_pdfs = []
+    group_pdfs   = {g: [] for g, _ in LABEL_GROUPS}
+    dispatching: dict[str, list[str]] = {}  # {prov_code: [shipment_codes]}
 
     for code, r in zip(codes, raw_results):
         if isinstance(r, Exception):
@@ -438,12 +442,10 @@ async def run_flipkart_flow(
                 invoice_pdfs.append(r["invoice_pdf"])
             if r["label_pdf"] and r["group"]:
                 group_pdfs.setdefault(r["group"], []).append(r["label_pdf"])
-            manifest_codes.append(r["code"])
-            if not manifest_provider_code and r["prov_code"]:
-                manifest_provider_code = r["prov_code"]
-                manifest_method_code   = r["method"]
+            prov = (r["prov_code"] or "UNKNOWN").upper()
+            dispatching.setdefault(prov, []).append(r["code"])
 
-    # ── Save PDFs ──────────────────────────────────────────────────────────────
+    # ── Save PDFs ──────────────────────────────────────────────────────────────────────────────
     if invoice_pdfs:
         save_pdf(merge_pdfs(invoice_pdfs), OUTPUT_DIR / "Flipkart_Invoices.pdf")
 
@@ -452,22 +454,68 @@ async def run_flipkart_flow(
             save_pdf(merge_pdfs(pdfs), OUTPUT_DIR / f"Flipkart_Labels_{group_name}_{len(pdfs)}.pdf")
             log.info(f"  Saved: Flipkart_Labels_{group_name}_{len(pdfs)}.pdf ({len(pdfs)} labels)")
 
-    # ── Single manifest for all Flipkart shipments ─────────────────────────────
-    if manifest_codes:
-        log.info(f"Creating Flipkart manifest for {len(manifest_codes)} shipments…")
-        try:
-            _, _ = await client.create_and_complete_manifest(
-                channel="FLIPKART",
-                shipping_provider_code=manifest_provider_code or "UNKNOWN",
-                shipping_provider_name=manifest_provider_code or "UNKNOWN",
-                shipping_method_code="",
-                shipment_codes=manifest_codes,
-                third_party_shipping=True,
-                is_aggregator=False,
-            )
-        except Exception as e:
-            log.error(f"  Flipkart manifest failed: {e}")
-            errors.append(f"Flipkart manifest: {e}")
+    # ── One manifest per courier, with retry for mismatched packages ──────────────────
+    MANIFEST_CHUNK_SIZE = 200
+    total_dispatching = sum(len(v) for v in dispatching.values())
+    if dispatching:
+        log.info(f"Creating Flipkart manifest(s) for {total_dispatching} shipments across {len(dispatching)} courier(s)…")
+        all_excluded = []
+
+        for prov_code, prov_codes in dispatching.items():
+            chunks = [prov_codes[i:i+MANIFEST_CHUNK_SIZE] for i in range(0, len(prov_codes), MANIFEST_CHUNK_SIZE)]
+            if len(chunks) > 1:
+                log.info(f"  '{prov_code}': {len(prov_codes)} shipments → {len(chunks)} chunks of ≤{MANIFEST_CHUNK_SIZE}")
+            for chunk_idx, chunk in enumerate(chunks, 1):
+                label = f"'{prov_code}' chunk {chunk_idx}/{len(chunks)}" if len(chunks) > 1 else f"'{prov_code}'"
+                try:
+                    manifest_data, failed_codes = await client.create_and_complete_manifest(
+                        channel="FLIPKART",
+                        shipping_provider_code=prov_code,
+                        shipping_provider_name=prov_code,
+                        shipping_method_code="",
+                        shipment_codes=chunk,
+                        third_party_shipping=True,
+                        is_aggregator=False,
+                    )
+                    log.info(f"  ✓ Manifest created for {label} ({len(chunk) - len(failed_codes)}/{len(chunk)} shipments)")
+                    if failed_codes:
+                        all_excluded.extend(failed_codes)
+                except Exception as e:
+                    log.error(f"  Flipkart manifest failed for {label}: {e}")
+                    errors.append(f"Flipkart manifest {prov_code}: {e}")
+
+        # ── Retry excluded codes with their actual assigned carrier ────────────────────
+        if all_excluded:
+            log.info(f"  Retrying {len(all_excluded)} excluded Flipkart code(s) with their actual carrier…")
+            retry_by_provider: dict[str, list[str]] = {}
+            for code in all_excluded:
+                try:
+                    detail = await client.get_shipment_details(code)
+                    actual_prov = (detail.get("shipping_provider") or "UNKNOWN").upper()
+                    retry_by_provider.setdefault(actual_prov, []).append(code)
+                    log.info(f"    {code} → actual carrier: {actual_prov}")
+                except Exception as e:
+                    log.error(f"    Could not fetch carrier for {code}: {e}")
+
+            for prov_code, retry_codes in retry_by_provider.items():
+                try:
+                    _, still_failed = await client.create_and_complete_manifest(
+                        channel="FLIPKART",
+                        shipping_provider_code=prov_code,
+                        shipping_provider_name=prov_code,
+                        shipping_method_code="",
+                        shipment_codes=retry_codes,
+                        third_party_shipping=True,
+                        is_aggregator=False,
+                    )
+                    log.info(f"  ✓ Retry manifest for '{prov_code}' ({len(retry_codes) - len(still_failed)}/{len(retry_codes)} added)")
+                    if still_failed:
+                        for c in still_failed:
+                            log.error(f"  ✗ {c} still excluded — manual dispatch required")
+                            errors.append(f"Flipkart dispatch {c}: excluded from manifest after retry")
+                except Exception as e:
+                    log.error(f"  Retry manifest failed for '{prov_code}': {e}")
+                    errors.append(f"Flipkart retry manifest {prov_code}: {e}")
 
     return errors
 
@@ -660,29 +708,36 @@ async def run_shopify_flow(client, dry_run: bool, limit: int = None, filter_date
             log.info(f"  Saved: Shopify_Labels_{display}_{len(pdfs)}.pdf ({len(pdfs)} labels)")
 
     # ── Step 6: One manifest per provider group, retry excluded codes ────────────
+    # Unicommerce caps manifests at 200 shipments — chunk if needed.
+    MANIFEST_CHUNK_SIZE = 200
     total_dispatching = sum(len(v) for v in dispatching.values())
     if dispatching:
         log.info(f"Creating Shopify manifest(s) for {total_dispatching} shipments across {len(dispatching)} provider(s)…")
         all_excluded = []
 
         for prov_code, prov_codes in dispatching.items():
-            try:
-                _, failed_codes = await client.create_and_complete_manifest(
-                    channel="SHOPIFY",
-                    shipping_provider_code=prov_code,
-                    shipping_provider_name=prov_code,
-                    shipping_method_code="",
-                    shipment_codes=prov_codes,
-                    third_party_shipping=False,
-                    is_aggregator=True,
-                    shipping_courier=prov_code,
-                )
-                log.info(f"  ✓ Manifest created for '{prov_code}' ({len(prov_codes) - len(failed_codes)}/{len(prov_codes)} shipments)")
-                if failed_codes:
-                    all_excluded.extend(failed_codes)
-            except Exception as e:
-                log.error(f"  Shopify manifest failed for '{prov_code}': {e}")
-                errors.append(f"Shopify manifest {prov_code}: {e}")
+            chunks = [prov_codes[i:i+MANIFEST_CHUNK_SIZE] for i in range(0, len(prov_codes), MANIFEST_CHUNK_SIZE)]
+            if len(chunks) > 1:
+                log.info(f"  '{prov_code}': {len(prov_codes)} shipments → {len(chunks)} manifest chunks of ≤{MANIFEST_CHUNK_SIZE}")
+            for chunk_idx, chunk in enumerate(chunks, 1):
+                label = f"'{prov_code}' chunk {chunk_idx}/{len(chunks)}" if len(chunks) > 1 else f"'{prov_code}'"
+                try:
+                    _, failed_codes = await client.create_and_complete_manifest(
+                        channel="SHOPIFY",
+                        shipping_provider_code=prov_code,
+                        shipping_provider_name=prov_code,
+                        shipping_method_code="",
+                        shipment_codes=chunk,
+                        third_party_shipping=False,
+                        is_aggregator=True,
+                        shipping_courier=prov_code,
+                    )
+                    log.info(f"  ✓ Manifest created for {label} ({len(chunk) - len(failed_codes)}/{len(chunk)} shipments)")
+                    if failed_codes:
+                        all_excluded.extend(failed_codes)
+                except Exception as e:
+                    log.error(f"  Shopify manifest failed for {label}: {e}")
+                    errors.append(f"Shopify manifest {prov_code}: {e}")
 
         # ── Retry excluded codes by fetching their actual assigned carrier ────
         if all_excluded:
